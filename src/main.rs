@@ -1,11 +1,11 @@
 mod network;
 mod peer;
+mod message;
 
-use network::network::placeholder as network_placeholder;
-use peer::peer::placeholder as peer_placeholder;
+use network::start_server;
 
-
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("**********");
     println!("*");
     println!("*");
@@ -16,7 +16,11 @@ fn main() {
     println!("*");
     println!("**********");
     println!("");
+    
     println!("Illuminate!");
-    network_placeholder();
-    peer_placeholder();
+    let address = "127.0.0.1:8080";
+    if let Err(e) = start_server(address).await {
+        eprintln!("Server error: {}", e);
+    }
+    
 }

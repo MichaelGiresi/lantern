@@ -1,7 +1,7 @@
 use serde::{Serialize, Deserialize};
-use std::net::SocketAddr;
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Peer {
-    pub address: SocketAddr,
+pub enum Message {
+    Ping,
+    Pong,
 }
