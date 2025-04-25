@@ -1,11 +1,25 @@
 [package]
-name = "north"
+name = "cuneos-blockchain"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.44", features = ["full"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }
-serde_derive = "1.0"
-bincode = "1.3"
+serde_json = "1.0"
+sha2 = "0.10"
+sha3 = "0.10"
+aes-gcm = "0.10"
+ecdsa = { version = "0.16", features = ["der"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+merkletree = "0.23"
+igd = "0.12"
+generic-array = "1.1"
+rcgen = "0.13"
 rand = "0.8"
+if-addrs = "0.10"
