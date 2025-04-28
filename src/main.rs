@@ -9,8 +9,8 @@ use tokio::sync::{mpsc::Sender, Mutex};
 use tokio::time::sleep;
 use tokio::process::Command;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig};
-use rustls::client::ServerName;
+use tokio_rustls::rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig};
+use tokio_rustls::rustls::client::ServerName;
 use serde::{Serialize, Deserialize};
 use serde_json;
 use sha3::Sha3_256;
@@ -24,7 +24,7 @@ use ecdsa::signature::{Signer, Verifier};
 use p256::{ecdsa::{SigningKey, VerifyingKey}, SecretKey, AffinePoint};
 use rand::rngs::OsRng;
 use tracing::{info, error};
-use tracing_subscriber::{fmt, filter::EnvFilter, Layer};
+use tracing_subscriber::{fmt, EnvFilter, Layer};
 use tracing_subscriber::prelude::*;
 use std::fs::File;
 use merkletree::store::VecStore;
@@ -32,9 +32,10 @@ use merkletree::merkle::MerkleTree;
 use merkletree::hash::Algorithm;
 use igd::{SearchOptions, PortMappingProtocol};
 use std::hash::Hasher as StdHasher;
-use generic_array::GenericArray;
 use if_addrs::get_if_addrs;
-use der::asn1::Ia5String;
+use yasna::models::ObjectIdentifier;
+use generic_array::GenericArray;
+use typenum::U32;
 
 const MAX_PEERS: usize = 50;
 const BANDWIDTH_LIMIT: u64 = 1024 * 1024;
@@ -122,7 +123,9 @@ fn load_or_generate_node_key() -> (SigningKey, VerifyingKey) {
     if Path::new(path).exists() {
         let contents = std::fs::read_to_string(path).expect("Failed to read node_key.json");
         let node_key: NodeKey = serde_json::from_str(&contents).expect("Failed to parse node_key.json");
-        let signing_key = SigningKey::from_bytes(&node_key.private_key[..]).expect("Invalid private key");
+        let signing_key = SigningKey::from_bytes(
+            GenericArray::from_slice(&node_key.private_key)
+        ).expect("Invalid private key");
         let verifying_key = VerifyingKey::from_sec1_bytes(&node_key.public_key).expect("Invalid public key");
         (signing_key, verifying_key)
     } else {
@@ -151,10 +154,9 @@ fn generate_user_key_nonce(user_id: &str) -> (Vec<u8>, Vec<u8>) {
 fn sign_transaction(tx: &Transaction, signing_key: &SigningKey) -> String {
     let input = format!("{}{}{}{}", tx.sender, tx.receiver, tx.amount, tx.fee);
     let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let finalized = hasher.finalize();
-    let digest: [u8; 32] = finalized[..32].try_into().unwrap();
-    let signature: Signature<p256::NistP256> = signing_key.sign(&digest);
+hasher.update(input.as_bytes());
+let digest = hasher.finalize(); // Use finalize directly
+let signature: Signature<p256::NistP256> = signing_key.sign(&digest);
     hex::encode(signature.to_der().as_bytes())
 }
 
@@ -163,28 +165,31 @@ fn verify_transaction(tx: &Transaction, verifying_key: &VerifyingKey) -> bool {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     let finalized = hasher.finalize();
-    let digest: [u8; 32] = finalized[..32].try_into().unwrap();
+    let digest = GenericArray::<u8, U32>::from_slice(&finalized[..32]);
     let signature_bytes = hex::decode(&tx.signature).unwrap_or_default();
     match Signature::<p256::NistP256>::from_der(&signature_bytes) {
-        Ok(signature) => verifying_key.verify(&digest, &signature).is_ok(),
+        Ok(signature) => verifying_key.verify(digest, &signature).is_ok(),
         Err(_) => false,
     }
 }
 
 fn generate_certificates() -> Result<(rcgen::Certificate, rcgen::KeyPair), String> {
-    let mut params = rcgen::CertificateParams::default();
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]);
+    params.distinguished_name = rcgen::DistinguishedName::new();
     params.subject_alt_names = vec![
-        rcgen::SanType::DnsName(Ia5String::new("localhost").map_err(|e| format!("Failed to create Ia5String: {}", e))?.into()),
+        rcgen::SanType::DnsName("localhost".to_string()),
         rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)))
     ];
-    let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("Failed to generate key pair: {}", e))?;
-    let cert = rcgen::Certificate::from_params(params).map_err(|e| format!("Failed to generate certificate: {}", e))?;
+    let key_pair = rcgen::KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| format!("Failed to generate key pair: {}", e))?;
+    let cert = rcgen::Certificate::from_params(params)
+        .map_err(|e| format!("Failed to generate certificate: {}", e))?;
     Ok((cert, key_pair))
 }
 
 fn save_certificates(cert: &rcgen::Certificate, key_pair: &rcgen::KeyPair) -> Result<(), String> {
     let mut cert_file = File::create("cert.pem").map_err(|e| format!("Failed to create cert.pem: {}", e))?;
-    cert_file.write_all(cert.serialize_pem().map_err(|e| format!("Failed to serialize cert: {}", e))?.as_bytes())
+    cert_file.write_all(cert.serialize_pem().unwrap().as_bytes())
         .map_err(|e| format!("Failed to write cert.pem: {}", e))?;
     let mut key_file = File::create("key.pem").map_err(|e| format!("Failed to create key.pem: {}", e))?;
     key_file.write_all(key_pair.serialize_pem().as_bytes()).map_err(|e| format!("Failed to write key.pem: {}", e))?;
@@ -201,15 +206,13 @@ async fn load_certificates() -> Result<(Vec<Certificate>, PrivateKey), String> {
     let key_file = tokio::fs::read("key.pem").await.map_err(|e| format!("Failed to read key.pem: {}", e))?;
 
     let certs = rustls_pemfile::certs(&mut &cert_file[..])
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to parse certificates: {}", e))?;
-    let certs = certs.into_iter().map(Certificate).collect();
+    .map_err(|e| format!("Failed to parse certificates: {}", e))?;
+let certs = certs.into_iter().map(Certificate).collect();
 
-    let key = rustls_pemfile::pkcs8_private_keys(&mut &key_file[..])
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to parse private key: {}", e))?;
-    let key = key.into_iter().next().ok_or("No private key found")?;
-    let key = PrivateKey(key);
+let key = rustls_pemfile::pkcs8_private_keys(&mut &key_file[..])
+    .map_err(|e| format!("Failed to parse private key: {}", e))?;
+let key = key.into_iter().next().ok_or("No private key found")?;
+let key = PrivateKey(key);
 
     Ok((certs, key))
 }
@@ -219,7 +222,7 @@ async fn setup_tls_server_config() -> Result<Arc<ServerConfig>, String> {
     let config = ServerConfig::builder()
         .with_safe_default_cipher_suites()
         .with_safe_default_kx_groups()
-        .with_protocol_versions(&[&rustls::version::TLS13])
+        .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13])
         .map_err(|e| format!("Failed to configure TLS protocols: {}", e))?
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -230,14 +233,14 @@ async fn setup_tls_server_config() -> Result<Arc<ServerConfig>, String> {
 async fn setup_tls_client_config() -> Result<Arc<ClientConfig>, String> {
     let (certs, _) = load_certificates().await?;
     let mut root_store = RootCertStore::empty();
-    for cert in certs {
+    for cert in &certs {
         root_store.add(cert).map_err(|e| format!("Failed to add cert to root store: {}", e))?;
     }
 
     let config = ClientConfig::builder()
         .with_safe_default_cipher_suites()
         .with_safe_default_kx_groups()
-        .with_protocol_versions(&[&rustls::version::TLS13])
+        .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13])
         .map_err(|e| format!("Failed to configure TLS protocols: {}", e))?
         .with_root_certificates(root_store)
         .with_no_client_auth();
@@ -411,8 +414,22 @@ fn decrypt_data(ciphertext: &[u8], key: &[u8], nonce: &[u8]) -> Result<String, S
         .map_err(|e| format!("Failed to convert decrypted data to string: {}", e))
 }
 
+fn sanitize_filename(filename: &str) -> String {
+    filename
+        .replace("..", "")
+        .replace("/", "")
+        .replace("\\", "")
+        .replace(":", "")
+}
+
 #[derive(Clone, Default)]
 struct Sha256Algorithm(Sha256);
+
+impl Sha256Algorithm {
+    fn new() -> Sha256Algorithm {
+        Sha256Algorithm(Sha256::new())
+    }
+}
 
 impl Algorithm<[u8; 32]> for Sha256Algorithm {
     fn hash(&mut self) -> [u8; 32] {
@@ -516,7 +533,6 @@ fn calculate_difficulty(chain: &[Block], target_time: u64) -> u32 {
         last_block.header.difficulty
     }
 }
-
 async fn validate_block(block: &Block, previous_block: &Block, peers: &Arc<Mutex<Vec<Peer>>>, _balances: &Arc<Mutex<Balance>>) -> bool {
     if block.header.index != previous_block.header.index + 1 {
         return false;
@@ -654,7 +670,9 @@ async fn delete_user_data(blockchain: Arc<Mutex<Vec<Block>>>, user_id: &str) {
     if modified {
         let blocks_to_save = blockchain.lock().await.clone();
         for block in blocks_to_save {
-            save_block_to_file(&block).await.expect("Failed to save block");
+            if let Err(e) = save_block_to_file(&block).await {
+                error!("Failed to save block {}: {}", block.header.index, e);
+            }
         }
     }
 }
@@ -689,10 +707,14 @@ async fn resolve_chain(blockchain: Arc<Mutex<Vec<Block>>>, new_chain: Vec<Block>
     *blockchain_lock = new_chain;
     drop(blockchain_lock);
     for block in blockchain.lock().await.iter() {
-        save_block_to_file(block).await.expect("Failed to save block");
+        if let Err(e) = save_block_to_file(block).await {
+            error!("Failed to save block {}: {}", block.header.index, e);
+        }
     }
     let balances_clone = _balances.lock().await.clone();
-    save_balances(&balances_clone).await.expect("Failed to save balances");
+    if let Err(e) = save_balances(&balances_clone).await {
+        error!("Failed to save balances: {}", e);
+    }
     true
 }
 async fn send_ack(stream: &mut (impl AsyncWriteExt + Unpin), message_id: &str) {
@@ -727,10 +749,9 @@ async fn handle_client_stream(
     let blockchain_clone = Arc::clone(&blockchain);
     let pending_pool_clone = Arc::clone(&pending_pool);
     let balances_clone = Arc::clone(&_balances);
-    let _signing_key_clone = signing_key.clone();
+    let signing_key_clone = signing_key.clone();
     tokio::spawn(async move {
         while let Some((new_stream, addr, _pub_key)) = new_peer_rx.recv().await {
-            // Process new peer connection iteratively, avoiding recursion
             let mut inner_stream = new_stream;
             let mut inner_buffer = [0; 4096];
             let mut inner_public_key: Option<VerifyingKey> = None;
@@ -776,9 +797,10 @@ async fn handle_client_stream(
                                 }
                             };
                             if !peer_infos.is_empty() {
-                                save_peer_list(&peer_infos).await.expect("Failed to save peer list");
+                                if let Err(e) = save_peer_list(&peer_infos).await {
+                                    error!("Failed to save peer list: {}", e);
+                                }
                             }
-                            // Send peer list to the newly authenticated peer
                             send_peer_list(Arc::clone(&peers_clone), &mut inner_stream).await;
                             continue;
                         }
@@ -803,8 +825,8 @@ async fn handle_client_stream(
                                 let safe_filename = sanitize_filename(filename);
                                 let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                                 let output_path = format!("received_files/{}_{}", timestamp, safe_filename);
-                                tokio::fs::create_dir_all("received_files").await.expect("Failed to create received_files dir");
-                                tokio::fs::write(&output_path, content).await.expect("Failed to write file");
+                                tokio::fs::create_dir_all("received_files").await.map_err(|e| error!("Failed to create received_files dir: {}", e)).ok();
+                                tokio::fs::write(&output_path, content).await.map_err(|e| error!("Failed to write file: {}", e)).ok();
                                 info!("Received file from {}: {} ({} bytes)", addr, output_path, size);
                                 tx_clone.send(format!("Received file: {} ({} bytes)", output_path, size))
                                     .await
@@ -814,7 +836,7 @@ async fn handle_client_stream(
                         } else if message.starts_with("BLOCK|") {
                             let json = message[6..].trim();
                             if let Ok(block) = serde_json::from_str::<Block>(json) {
-                                let (_last_block, is_valid) = {
+                                let (last_block, is_valid) = {
                                     let blockchain_lock = blockchain_clone.lock().await;
                                     let last_block = blockchain_lock.last().unwrap_or(&Block {
                                         header: BlockHeader {
@@ -838,9 +860,13 @@ async fn handle_client_stream(
                                         let mut blockchain_lock = blockchain_clone.lock().await;
                                         blockchain_lock.push(block_clone);
                                     }
-                                    save_block_to_file(&block).await.expect("Failed to save block");
+                                    if let Err(e) = save_block_to_file(&block).await {
+                                        error!("Failed to save block {}: {}", block.header.index, e);
+                                    }
                                     let balances_clone = balances_clone.lock().await.clone();
-                                    save_balances(&balances_clone).await.expect("Failed to save balances");
+                                    if let Err(e) = save_balances(&balances_clone).await {
+                                        error!("Failed to save balances: {}", e);
+                                    }
                                     info!("Received block from {}: index {}", addr, block.header.index);
                                     tx_clone.send(format!("Received block: index {}", block.header.index))
                                         .await
@@ -864,7 +890,9 @@ async fn handle_client_stream(
                                         pool_lock.transactions.push(tx_data.clone());
                                         pool_lock.clone()
                                     };
-                                    save_pending_pool(&pool_clone).await.expect("Failed to save pending pool");
+                                    if let Err(e) = save_pending_pool(&pool_clone).await {
+                                        error!("Failed to save pending pool: {}", e);
+                                    }
                                     info!("Received transaction from {}: {} -> {} ({})", addr, tx_data.sender, tx_data.receiver, tx_data.amount);
                                     tx_clone.send(format!("Received transaction: {} -> {} ({})", tx_data.sender, tx_data.receiver, tx_data.amount))
                                         .await
@@ -884,7 +912,9 @@ async fn handle_client_stream(
                                     pool_lock.user_data.push(user_data.clone());
                                     pool_lock.clone()
                                 };
-                                save_pending_pool(&pool_clone).await.expect("Failed to save pending pool");
+                                if let Err(e) = save_pending_pool(&pool_clone).await {
+                                    error!("Failed to save pending pool: {}", e);
+                                }
                                 info!("Received user data from {} for ID: {}", addr, user_data.user_id);
                                 tx_clone.send(format!("Received user data for ID: {}", user_data.user_id))
                                     .await
@@ -1017,9 +1047,10 @@ async fn handle_client_stream(
                         }
                     };
                     if !peer_infos.is_empty() {
-                        save_peer_list(&peer_infos).await.expect("Failed to save peer list");
+                        if let Err(e) = save_peer_list(&peer_infos).await {
+                            error!("Failed to save peer list: {}", e);
+                        }
                     }
-                    // Send peer list to the newly authenticated peer
                     send_peer_list(Arc::clone(&peers), &mut stream).await;
                     continue;
                 }
@@ -1044,8 +1075,8 @@ async fn handle_client_stream(
                         let safe_filename = sanitize_filename(filename);
                         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                         let output_path = format!("received_files/{}_{}", timestamp, safe_filename);
-                        tokio::fs::create_dir_all("received_files").await.expect("Failed to create received_files dir");
-                        tokio::fs::write(&output_path, content).await.expect("Failed to write file");
+                        tokio::fs::create_dir_all("received_files").await.map_err(|e| error!("Failed to create received_files dir: {}", e)).ok();
+                        tokio::fs::write(&output_path, content).await.map_err(|e| error!("Failed to write file: {}", e)).ok();
                         info!("Received file: {} ({} bytes)", output_path, size);
                         tx.send(format!("Received file: {} ({} bytes)", output_path, size))
                             .await
@@ -1075,6 +1106,8 @@ async fn handle_client_stream(
                                     let _ = new_peer_tx.send((new_stream, socket_addr, *public_key)).await;
                                 }
                             }
+                        } else {
+                            error!("Invalid peer address: {}", addr_str);
                         }
                     }
                     if !new_peers.is_empty() {
@@ -1086,12 +1119,14 @@ async fn handle_client_stream(
                                 public_key: hex::encode(p.public_key.to_encoded_point(false)),
                             }).collect::<Vec<PeerInfo>>()
                         };
-                        save_peer_list(&peer_infos).await.expect("Failed to save peer list");
+                        if let Err(e) = save_peer_list(&peer_infos).await {
+                            error!("Failed to save peer list: {}", e);
+                        }
                     }
                 } else if message.starts_with("BLOCK|") {
                     let json = message[6..].trim();
                     if let Ok(block) = serde_json::from_str::<Block>(json) {
-                        let (_last_block, is_valid) = {
+                        let (last_block, is_valid) = {
                             let blockchain_lock = blockchain.lock().await;
                             let last_block = blockchain_lock.last().unwrap_or(&Block {
                                 header: BlockHeader {
@@ -1115,9 +1150,13 @@ async fn handle_client_stream(
                                 let mut blockchain_lock = blockchain.lock().await;
                                 blockchain_lock.push(block_clone);
                             }
-                            save_block_to_file(&block).await.expect("Failed to save block");
+                            if let Err(e) = save_block_to_file(&block).await {
+                                error!("Failed to save block {}: {}", block.header.index, e);
+                            }
                             let balances_clone = _balances.lock().await.clone();
-                            save_balances(&balances_clone).await.expect("Failed to save balances");
+                            if let Err(e) = save_balances(&balances_clone).await {
+                                error!("Failed to save balances: {}", e);
+                            }
                             info!("Received block: index {}", block.header.index);
                             tx.send(format!("Received block: index {}", block.header.index))
                                 .await
@@ -1141,7 +1180,9 @@ async fn handle_client_stream(
                                 pool_lock.transactions.push(tx_data.clone());
                                 pool_lock.clone()
                             };
-                            save_pending_pool(&pool_clone).await.expect("Failed to save pending pool");
+                            if let Err(e) = save_pending_pool(&pool_clone).await {
+                                error!("Failed to save pending pool: {}", e);
+                            }
                             info!("Received transaction: {} -> {} ({})", tx_data.sender, tx_data.receiver, tx_data.amount);
                             tx.send(format!("Received transaction: {} -> {} ({})", tx_data.sender, tx_data.receiver, tx_data.amount))
                                 .await
@@ -1161,7 +1202,9 @@ async fn handle_client_stream(
                             pool_lock.user_data.push(user_data.clone());
                             pool_lock.clone()
                         };
-                        save_pending_pool(&pool_clone).await.expect("Failed to save pending pool");
+                        if let Err(e) = save_pending_pool(&pool_clone).await {
+                            error!("Failed to save pending pool: {}", e);
+                        }
                         info!("Received user data for ID: {}", user_data.user_id);
                         tx.send(format!("Received user data for ID: {}", user_data.user_id))
                             .await
@@ -1224,7 +1267,7 @@ async fn handle_client_stream(
                             error!("Failed to send block {}: {}", index, e);
                         }
                         if let Err(e) = stream.flush().await {
-                            error!("Failed to flush block {}: {}", index, e);
+                            error!("Failed to flush stream: {}", e);
                         }
                     }
                     send_ack(&mut stream, "REQUEST_BLOCK").await;
@@ -1308,9 +1351,10 @@ async fn handle_server_client(
                         }
                     };
                     if !peer_infos.is_empty() {
-                        save_peer_list(&peer_infos).await.expect("Failed to save peer list");
+                        if let Err(e) = save_peer_list(&peer_infos).await {
+                            error!("Failed to save peer list: {}", e);
+                        }
                     }
-                    // Send peer list to the newly authenticated peer
                     send_peer_list(Arc::clone(&peers), &mut stream).await;
                     continue;
                 }
@@ -1335,8 +1379,8 @@ async fn handle_server_client(
                         let safe_filename = sanitize_filename(filename);
                         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                         let output_path = format!("received_files/{}_{}", timestamp, safe_filename);
-                        tokio::fs::create_dir_all("received_files").await.expect("Failed to create received_files dir");
-                        tokio::fs::write(&output_path, content).await.expect("Failed to write file");
+                        tokio::fs::create_dir_all("received_files").await.map_err(|e| error!("Failed to create received_files dir: {}", e)).ok();
+                        tokio::fs::write(&output_path, content).await.map_err(|e| error!("Failed to write file: {}", e)).ok();
                         info!("Received file: {} ({} bytes)", output_path, size);
                         tx.send(format!("Received file: {} ({} bytes)", output_path, size))
                             .await
@@ -1382,6 +1426,8 @@ async fn handle_server_client(
                                     });
                                 }
                             }
+                        } else {
+                            error!("Invalid peer address: {}", addr_str);
                         }
                     }
                     if !new_peers.is_empty() {
@@ -1393,12 +1439,14 @@ async fn handle_server_client(
                                 public_key: hex::encode(p.public_key.to_encoded_point(false)),
                             }).collect::<Vec<PeerInfo>>()
                         };
-                        save_peer_list(&peer_infos).await.expect("Failed to save peer list");
+                        if let Err(e) = save_peer_list(&peer_infos).await {
+                            error!("Failed to save peer list: {}", e);
+                        }
                     }
                 } else if message.starts_with("BLOCK|") {
                     let json = message[6..].trim();
                     if let Ok(block) = serde_json::from_str::<Block>(json) {
-                        let (_last_block, is_valid) = {
+                        let (last_block, is_valid) = {
                             let blockchain_lock = blockchain.lock().await;
                             let last_block = blockchain_lock.last().unwrap_or(&Block {
                                 header: BlockHeader {
@@ -1422,9 +1470,13 @@ async fn handle_server_client(
                                 let mut blockchain_lock = blockchain.lock().await;
                                 blockchain_lock.push(block_clone);
                             }
-                            save_block_to_file(&block).await.expect("Failed to save block");
+                            if let Err(e) = save_block_to_file(&block).await {
+                                error!("Failed to save block {}: {}", block.header.index, e);
+                            }
                             let balances_clone = _balances.lock().await.clone();
-                            save_balances(&balances_clone).await.expect("Failed to save balances");
+                            if let Err(e) = save_balances(&balances_clone).await {
+                                error!("Failed to save balances: {}", e);
+                            }
                             info!("Received block: index {}", block.header.index);
                             tx.send(format!("Received block: index {}", block.header.index))
                                 .await
@@ -1448,7 +1500,9 @@ async fn handle_server_client(
                                 pool_lock.transactions.push(tx_data.clone());
                                 pool_lock.clone()
                             };
-                            save_pending_pool(&pool_clone).await.expect("Failed to save pending pool");
+                            if let Err(e) = save_pending_pool(&pool_clone).await {
+                                error!("Failed to save pending pool: {}", e);
+                            }
                             info!("Received transaction: {} -> {} ({})", tx_data.sender, tx_data.receiver, tx_data.amount);
                             tx.send(format!("Received transaction: {} -> {} ({})", tx_data.sender, tx_data.receiver, tx_data.amount))
                                 .await
@@ -1468,7 +1522,9 @@ async fn handle_server_client(
                             pool_lock.user_data.push(user_data.clone());
                             pool_lock.clone()
                         };
-                        save_pending_pool(&pool_clone).await.expect("Failed to save pending pool");
+                        if let Err(e) = save_pending_pool(&pool_clone).await {
+                            error!("Failed to save pending pool: {}", e);
+                        }
                         info!("Received user data for ID: {}", user_data.user_id);
                         tx.send(format!("Received user data for ID: {}", user_data.user_id))
                             .await
@@ -1531,7 +1587,7 @@ async fn handle_server_client(
                             error!("Failed to send block {}: {}", index, e);
                         }
                         if let Err(e) = stream.flush().await {
-                            error!("Failed to flush block {}: {}", index, e);
+                            error!("Failed to flush stream: {}", e);
                         }
                     }
                     send_ack(&mut stream, "REQUEST_BLOCK").await;
@@ -1654,11 +1710,12 @@ async fn send_file(peers: Arc<Mutex<Vec<Peer>>>, file_path: &str, signing_key: &
     }
     Ok(())
 }
-
 async fn send_block(peers: Arc<Mutex<Vec<Peer>>>, block: &mut Block, signing_key: &SigningKey) {
     block.header.merkle_root = calculate_merkle_root(&block.transactions);
     if mine_block(&mut block.header, &block.transactions) {
-        save_block_to_file(block).await.expect("Failed to save block");
+        if let Err(e) = save_block_to_file(block).await {
+            error!("Failed to save block {}: {}", block.header.index, e);
+        }
         let json = serde_json::to_string(block).expect("Failed to serialize block");
         let payload = format!("BLOCK|{}\n", json);
         let peers_to_process = {
@@ -1707,12 +1764,15 @@ async fn send_transaction(peers: Arc<Mutex<Vec<Peer>>>, tx: &Transaction, pendin
             peers_lock.remove(*i);
         }
     }
-    let pool_clone = {
+    let mut pool_clone = PendingPool { transactions: vec![], user_data: vec![] };
+    {
         let mut pool_lock = pending_pool.lock().await;
         pool_lock.transactions.push(tx.clone());
-        pool_lock.clone()
-    };
-    save_pending_pool(&pool_clone).await.expect("Failed to save pending pool");
+        pool_clone = pool_lock.clone();
+    }
+    if let Err(e) = save_pending_pool(&pool_clone).await {
+        error!("Failed to save pending pool: {}", e);
+    }
 }
 
 async fn send_user_data(peers: Arc<Mutex<Vec<Peer>>>, user_data: &UserData, pending_pool: Arc<Mutex<PendingPool>>, signing_key: &SigningKey) {
@@ -1738,12 +1798,15 @@ async fn send_user_data(peers: Arc<Mutex<Vec<Peer>>>, user_data: &UserData, pend
             peers_lock.remove(*i);
         }
     }
-    let pool_clone = {
+    let mut pool_clone = PendingPool { transactions: vec![], user_data: vec![] };
+    {
         let mut pool_lock = pending_pool.lock().await;
         pool_lock.user_data.push(user_data.clone());
-        pool_lock.clone()
-    };
-    save_pending_pool(&pool_clone).await.expect("Failed to save pending pool");
+        pool_clone = pool_lock.clone();
+    }
+    if let Err(e) = save_pending_pool(&pool_clone).await {
+        error!("Failed to save pending pool: {}", e);
+    }
 }
 
 async fn request_sync(peers: Arc<Mutex<Vec<Peer>>>, height: u64, signing_key: &SigningKey) {
@@ -1782,14 +1845,6 @@ async fn send_peer_list(peers: Arc<Mutex<Vec<Peer>>>, stream: &mut (impl AsyncWr
     if let Err(e) = stream.flush().await {
         error!("Failed to flush peer list: {}", e);
     }
-}
-
-fn sanitize_filename(filename: &str) -> String {
-    filename
-        .replace("..", "")
-        .replace("/", "")
-        .replace("\\", "")
-        .replace(":", "")
 }
 
 async fn get_status(
@@ -1845,7 +1900,9 @@ async fn auto_mine_blocks(
                 calculate_difficulty(&blockchain_lock, MINING_INTERVAL),
             )
         };
-        save_pending_pool(&pool_clone).await.expect("Failed to save pending pool");
+        if let Err(e) = save_pending_pool(&pool_clone).await {
+            error!("Failed to save pending pool: {}", e);
+        }
         let mut new_block = Block {
             header: BlockHeader {
                 index,
@@ -1874,7 +1931,6 @@ async fn main() {
     let subscriber = fmt::layer().with_filter(EnvFilter::from_default_env());
     tracing_subscriber::registry().with(subscriber).init();
 
-    // Detect local IP
     let local_ip = get_if_addrs()
         .expect("Failed to get network interfaces")
         .into_iter()
@@ -1894,14 +1950,12 @@ async fn main() {
             "0.0.0.0".to_string()
         });
 
-    // Determine listen and seed addresses
     let listen_addr = format!("0.0.0.0:{}", DEFAULT_PORT);
     let seed_addr = if local_ip == INITIAL_NODES[0] {
         format!("{}:{}", INITIAL_NODES[1], DEFAULT_PORT)
     } else if local_ip == INITIAL_NODES[1] {
         format!("{}:{}", INITIAL_NODES[0], DEFAULT_PORT)
     } else {
-        // New nodes try both initial nodes
         INITIAL_NODES.iter().map(|ip| format!("{}:{}", ip, DEFAULT_PORT)).collect::<Vec<_>>().join(",")
     };
 
@@ -2038,7 +2092,9 @@ async fn main() {
                         public_key: hex::encode(p.public_key.to_encoded_point(false)),
                     }).collect::<Vec<PeerInfo>>()
                 };
-                save_peer_list(&peer_infos).await.expect("Failed to save peer list");
+                if let Err(e) = save_peer_list(&peer_infos).await {
+                    error!("Failed to save peer list: {}", e);
+                }
             }
             sleep(Duration::from_secs(10)).await;
         }
@@ -2089,7 +2145,9 @@ async fn main() {
                     };
                     if !peer_infos.is_empty() {
                         info!("Connected to seed at {}", addr);
-                        save_peer_list(&peer_infos).await.expect("Failed to save peer list");
+                        if let Err(e) = save_peer_list(&peer_infos).await {
+                            error!("Failed to save peer list: {}", e);
+                        }
                         connected = true;
                     }
                     let tx_clone = tx_clone.clone();
@@ -2113,7 +2171,7 @@ async fn main() {
                     if let Ok(mut seed_stream) = connect_tls(addr, public_key, &signing_key_clone_2).await {
                         send_peer_list(peers_clone_for_list, &mut seed_stream).await;
                     }
-                    break; // Stop after successful connection
+                    break;
                 } else {
                     error!("Could not connect to seed {}: retrying", addr);
                 }
@@ -2169,7 +2227,9 @@ async fn main() {
                     pool_lock.clone(),
                 )
             };
-            save_pending_pool(&pool_clone).await.expect("Failed to save pending pool");
+            if let Err(e) = save_pending_pool(&pool_clone).await {
+                error!("Failed to save pending pool: {}", e);
+            }
             let mut new_block = Block {
                 header: BlockHeader {
                     index,
@@ -2226,9 +2286,9 @@ async fn main() {
                 let profile = parts[1].to_string();
                 let message = parts.get(2).map(|s| s.to_string()).unwrap_or_default();
                 let (encryption_key, nonce) = generate_user_key_nonce(&user_id);
-                let profile_encrypted = encrypt_data(&profile, &encryption_key, &nonce).expect("Failed to encrypt profile");
+                let profile_encrypted = encrypt_data(&profile, &encryption_key, &nonce).unwrap_or_default();
                 let message_encrypted = if !message.is_empty() {
-                    encrypt_data(&message, &encryption_key, &nonce).expect("Failed to encrypt message")
+                    encrypt_data(&message, &encryption_key, &nonce).unwrap_or_default()
                 } else {
                     vec![]
                 };
