@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, Ipv4Addr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,15 +13,14 @@ use tokio_rustls::rustls::client::ServerName;
 use serde_json;
 use p256::AffinePoint;
 use if_addrs::get_if_addrs;
-use std::net::{IpAddr, SocketAddrV4};
 use igd::{SearchOptions, PortMappingProtocol};
 use tracing::{info, error};
-use p256::ecdsa::{SigningKey, VerifyingKey,};
+use p256::ecdsa::{SigningKey, VerifyingKey};
 use super::blockchain::{Peer, PeerInfo, Transaction, UserData, Block, PendingPool, Balance, BlockHeader};
 use super::cryptography::{generate_certificates, save_certificates, verify_transaction};
 use super::storage::{save_peer_list, load_peer_list, save_block_to_file, save_pending_pool, save_balances};
 use super::utils::sanitize_filename;
-use std::net::{Ipv4Addr};
+use std::process::Stdio;
 
 pub async fn load_certificates() -> Result<(Vec<Certificate>, PrivateKey), String> {
     if !Path::new("cert.pem").exists() || !Path::new("key.pem").exists() {
@@ -85,7 +84,7 @@ pub async fn connect_tls(
     let stream = TcpStream::connect(addr).await
         .map_err(|e| format!("Failed to connect to {}: {}", addr, e))?;
     let mut stream = connector.connect(server_name, stream).await
-        .map_err(|e| format!("Failed to establish TLS with {}: {}", addr, e))?;
+        .map_err(|e| format!("Failed to establish TLS with {}: {:?}", addr, e))?;
 
     let auth_message = format!("AUTH|{}", hex::encode(signing_key.verifying_key().to_encoded_point(false)));
     stream.write_all(auth_message.as_bytes()).await
@@ -97,7 +96,6 @@ pub async fn connect_tls(
 }
 
 pub async fn setup_upnp(listen_addr: &str, port: u16) -> Result<(), String> {
-    // Get the local IPv4 address (non-loopback)
     let local_ip = get_if_addrs()
         .map_err(|e| format!("Failed to get network interfaces: {}", e))?
         .into_iter()
@@ -108,27 +106,23 @@ pub async fn setup_upnp(listen_addr: &str, port: u16) -> Result<(), String> {
         })
         .ok_or_else(|| "No valid IPv4 address found".to_string())?;
 
-    // Parse listen_addr but use local_ip for UPnP
     let addr = listen_addr
         .parse::<SocketAddr>()
         .map_err(|e| format!("Invalid listen address: {}", e))?;
     let addr_v4 = SocketAddrV4::new(local_ip, port);
 
-    // Retry logic
     let max_retries = 3;
     let mut last_error = None;
 
     for attempt in 1..=max_retries {
         info!("Attempting UPnP setup (attempt {}/{})", attempt, max_retries);
 
-        // Create SearchOptions for this attempt
         let search_options = SearchOptions {
             timeout: Some(std::time::Duration::from_secs(10)),
-            broadcast_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250)), 1900), // Standard UPnP multicast address
-            bind_addr: SocketAddr::new(IpAddr::V4(local_ip), 0), // Bind to local IP, ephemeral port
+            broadcast_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250)), 1900),
+            bind_addr: SocketAddr::new(IpAddr::V4(local_ip), 0),
         };
 
-        // Search for gateway
         let gateway = match igd::search_gateway(search_options) {
             Ok(gateway) => gateway,
             Err(e) => {
@@ -142,18 +136,15 @@ pub async fn setup_upnp(listen_addr: &str, port: u16) -> Result<(), String> {
             }
         };
 
-        // Attempt port mapping
         match gateway.add_port(
             PortMappingProtocol::TCP,
             port,
             addr_v4,
-            86400, // 24-hour lease
+            86400,
             "Cuneos Blockchain P2P",
         ) {
             Ok(_) => {
                 info!("UPnP port mapping added for {}:{}", local_ip, port);
-
-                // Verify gateway responsiveness by fetching external IP
                 match gateway.get_external_ip() {
                     Ok(external_ip) => {
                         info!("Verified UPnP setup: External IP is {}", external_ip);
@@ -192,39 +183,229 @@ pub async fn cleanup_upnp(port: u16) {
 }
 
 pub async fn setup_firewall(port: u16) -> Result<(), String> {
+    // Helper function to check if running with elevated privileges
+    async fn is_elevated() -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            let output = Command::new("net")
+                .args(&["session"])
+                .output()
+                .await;
+            output.is_ok() && output.unwrap().status.success()
+        }
+        #[cfg(unix)]
+        {
+            unsafe { libc::geteuid() == 0 }
+        }
+    }
+
+    // Helper function to run a command with sudo on Unix-like systems
+    async fn run_with_sudo(cmd: &str, args: &[&str]) -> Result<(), String> {
+        let mut command = Command::new("sudo");
+        command.arg(cmd).args(args);
+        let output = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute {}: {}", cmd, e))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Failed to run {}: {}",
+                cmd,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    if !is_elevated().await {
+        error!("Administrative privileges required to set up firewall rules.");
+        return Err(
+            "Please run the application as an administrator (Windows) or with sudo (Linux/macOS).".to_string(),
+        );
+    }
+
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("netsh")
+        // Try triggering a Windows Firewall prompt by binding to the port
+        if let Ok(listener) = TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+            info!("Bound to port {} to trigger firewall prompt", port);
+            drop(listener); // Drop immediately to avoid holding the port
+        } else {
+            error!("Failed to bind to port {} for firewall prompt", port);
+        }
+
+        // Check for existing rules for port 8080 (not just named Cuneos_P2P_8080)
+        let rule_check = Command::new("netsh")
+            .args(&[
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                "name=all",
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to check firewall rules: {}", e))?;
+
+        let rule_output = String::from_utf8_lossy(&rule_check.stdout);
+        if rule_output.contains(&port.to_string()) {
+            info!("Firewall rule for port {} already exists", port);
+            return Ok(());
+        }
+
+        // Try netsh to add port-based rule
+        let rule_name = format!("Cuneos_P2P_{}", port);
+        let netsh_output = Command::new("netsh")
             .args(&[
                 "advfirewall",
                 "firewall",
                 "add",
                 "rule",
-                &format!("name=Cuneos_P2P_{}", port),
+                &format!("name={}", rule_name),
                 "dir=in",
                 "action=allow",
                 "protocol=TCP",
                 &format!("localport={}", port),
+                "profile=any",
             ])
             .output()
             .await
             .map_err(|e| format!("Failed to execute netsh: {}", e))?;
-        if !output.status.success() {
-            return Err(format!("Failed to add firewall rule: {:?}", output.stderr));
+
+        if netsh_output.status.success() {
+            info!("Firewall rule added for port {} using netsh", port);
+            return Ok(());
         }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let output = Command::new("ufw")
-            .args(&["allow", &port.to_string()])
+
+        // Fallback to PowerShell for port-based rule
+        let ps_command = format!(
+            "New-NetFirewallRule -Name 'Cuneos_P2P_{}' -DisplayName 'Cuneos P2P {}' \
+            -Direction Inbound -Protocol TCP -LocalPort {} -Action Allow",
+            port, port, port
+        );
+        let ps_output = Command::new("powershell")
+            .args(&["-Command", &ps_command])
             .output()
             .await
-            .map_err(|e| format!("Failed to execute ufw: {}", e))?;
-        if !output.status.success() {
-            return Err(format!("Failed to add firewall rule: {:?}", output.stderr));
+            .map_err(|e| format!("Failed to execute PowerShell: {}", e))?;
+
+        if ps_output.status.success() {
+            info!("Firewall rule added for port {} using PowerShell", port);
+            return Ok(());
         }
+
+        // Fallback to adding the executable to allowed apps
+        let exe_path = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or("cuneos_blockchain.exe".to_string());
+        let netsh_exe_output = Command::new("netsh")
+            .args(&[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name=Cuneos_P2P_Exe_{}", port),
+                "dir=in",
+                "action=allow",
+                &format!("program={}", exe_path),
+                "protocol=TCP",
+                "profile=any",
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute netsh for executable: {}", e))?;
+
+        if netsh_exe_output.status.success() {
+            info!("Firewall rule added for executable {} using netsh", exe_path);
+            return Ok(());
+        }
+
+        // Construct detailed error message
+        let netsh_error = String::from_utf8_lossy(&netsh_output.stderr);
+        let ps_error = String::from_utf8_lossy(&ps_output.stderr);
+        let netsh_exe_error = String::from_utf8_lossy(&netsh_exe_output.stderr);
+        return Err(format!(
+            "Failed to add firewall rule: netsh error: {}, PowerShell error: {}, netsh executable error: {}",
+            netsh_error, ps_error, netsh_exe_error
+        ));
     }
-    Ok(())
+
+    #[cfg(target_os = "linux")]
+    {
+        let ufw_check = Command::new("ufw")
+            .args(&["status"])
+            .output()
+            .await;
+
+        if ufw_check.is_ok() && ufw_check.unwrap().status.success() {
+            let ufw_output = run_with_sudo("ufw", &[&format!("allow {}", port)]).await;
+            if ufw_output.is_ok() {
+                info!("Firewall rule added for port {} using ufw", port);
+                return Ok(());
+            }
+        }
+
+        let iptables_rule = format!("-A INPUT -p tcp --dport {} -j ACCEPT", port);
+        let iptables_output = run_with_sudo("iptables", &["-C", "INPUT", "-p", "tcp", "--dport", &port.to_string(), "-j", "ACCEPT"])
+            .await;
+
+        if iptables_output.is_ok() {
+            info!("Firewall rule for port {} already exists in iptables", port);
+            return Ok(());
+        }
+
+        let iptables_add = run_with_sudo("iptables", &["-A", "INPUT", "-p", "tcp", "--dport", &port.to_string(), "-j", "ACCEPT"])
+            .await;
+
+        if iptables_add.is_ok() {
+            info!("Firewall rule added for port {} using iptables", port);
+            return Ok(());
+        }
+
+        return Err(format!(
+            "Failed to add firewall rule: ufw error: {}, iptables error: {}",
+            ufw_output.unwrap_err(),
+            iptables_add.unwrap_err()
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let pf_conf = format!(
+            "pass in on any proto tcp from any to any port {} keep state\n",
+            port
+        );
+        let pf_path = "/tmp/cuneos_p2p_pf.conf";
+        tokio::fs::write(pf_path, pf_conf)
+            .await
+            .map_err(|e| format!("Failed to write pf config: {}", e))?;
+
+        let pf_check = Command::new("pfctl")
+            .args(&["-s", "rules"])
+            .output()
+            .await;
+
+        if pf_check.is_ok() && String::from_utf8_lossy(&pf_check.unwrap().stdout).contains(&port.to_string()) {
+            info!("Firewall rule for port {} already exists in pf", port);
+            return Ok(());
+        }
+
+        let pf_output = run_with_sudo("pfctl", &["-f", pf_path, "-e"]).await;
+
+        if pf_output.is_ok() {
+            info!("Firewall rule added for port {} using pfctl", port);
+            return Ok(());
+        }
+
+        return Err(format!("Failed to add firewall rule using pfctl: {}", pf_output.unwrap_err()));
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        Err("Firewall configuration not supported on this platform".to_string())
+    }
 }
 
 pub async fn cleanup_firewall(port: u16) {
@@ -232,10 +413,7 @@ pub async fn cleanup_firewall(port: u16) {
     {
         if let Err(e) = Command::new("netsh")
             .args(&[
-                "advfirewall",
-                "firewall",
-                "delete",
-                "rule",
+                "advfirewall", "firewall", "delete", "rule",
                 &format!("name=Cuneos_P2P_{}", port),
             ])
             .output()
@@ -282,7 +460,6 @@ pub async fn handle_client_stream(
     let start_time = SystemTime::now();
     let (new_peer_tx, mut new_peer_rx) = tokio::sync::mpsc::channel::<(tokio_rustls::client::TlsStream<TcpStream>, SocketAddr, VerifyingKey)>(100);
 
-    // Spawn a separate task to handle new peer connections iteratively
     let peers_clone = Arc::clone(&peers);
     let tx_clone = tx.clone();
     let blockchain_clone = Arc::clone(&blockchain);
@@ -735,24 +912,22 @@ pub async fn handle_client_stream(
                     }
                 } else if message.starts_with("USER_DATA|") {
                     let json = message[10..].trim();
-                    match serde_json::from_str::<UserData>(json) {
-                        Ok(user_data) => {
+                    if let Ok(user_data) = serde_json::from_str::<UserData>(json) {
+                        let pool_clone = {
                             let mut pool_lock = pending_pool.lock().await;
                             pool_lock.user_data.push(user_data.clone());
-                            if let Err(e) = save_pending_pool(&*pool_lock).await {
-                                error!("Failed to save pending pool: {}", e);
-                            }
-                            info!("Received user data for ID: {}", user_data.user_id);
-                            tx.send(format!("Received user data for ID: {}", user_data.user_id))
-                                .await
-                                .expect("Failed to send to main thread");
-                            send_ack(&mut stream, "USER_DATA").await;
+                            pool_lock.clone()
+                        };
+                        if let Err(e) = save_pending_pool(&pool_clone).await {
+                            error!("Failed to save pending pool: {}", e);
                         }
-                        Err(_) => {
-                            tx.send("Failed to parse user data".to_string())
-                                .await
-                                .expect("Failed to send to main thread");
-                        }
+                        info!("Received user data for ID: {}", user_data.user_id);
+                        tx.send(format!("Received user data for ID: {}", user_data.user_id))
+                            .await
+                            .expect("Failed to send to main thread");
+                        send_ack(&mut stream, "USER_DATA").await;
+                    } else {
+                        tx.send("Failed to parse user data".to_string()).await.expect("Failed to send to main thread");
                     }
                 } else if message.starts_with("SYNC|") {
                     let height: u64 = message[5..].trim().parse().unwrap_or(0);
@@ -1197,7 +1372,7 @@ pub async fn send_file(peers: Arc<Mutex<Vec<Peer>>>, file_path: &str, signing_ke
     let mut buffer = vec![0; 4096];
     let mut total_sent = 0;
     let mut bytes_sent = 0;
-    let start_time = SystemTime::now();
+   let start_time = SystemTime::now();
 
     let peers_to_process = {
         let peers_lock = peers.lock().await;
